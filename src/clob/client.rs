@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(feature = "heartbeats")]
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -407,7 +406,21 @@ impl Default for Client<Unauthenticated> {
     }
 }
 
-/// Configuration for [`Client`]
+/// Configuration for [`Client`].
+///
+/// In addition to protocol-level knobs (`use_server_time`, `geoblock_host`,
+/// `builder_code`, optional `heartbeat_interval`), this struct exposes the
+/// HTTP client transport parameters that previously had to be accepted at
+/// `reqwest::Client::builder()`'s defaults. The defaults below are tuned
+/// for latency-sensitive trading against the Polymarket CLOB API:
+/// short timeouts, an idle-persistent connection pool, HTTP/2 prior
+/// knowledge to skip ALPN, and HTTP/2 keep-alive pings so a hung TCP
+/// connection is detected within ~30 s rather than the OS keepalive
+/// default (~2 h on Linux).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Each bool is an independent HTTP/2 transport knob that maps directly onto a reqwest builder method; bundling them into an enum would obscure the underlying API."
+)]
 #[derive(Clone, Debug, Builder)]
 pub struct Config {
     /// Whether the [`Client`] will use the server time provided by Polymarket when creating auth
@@ -425,6 +438,57 @@ pub struct Config {
     #[builder(default = Duration::from_secs(5))]
     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
     heartbeat_interval: Duration,
+    /// Maximum time to wait for the TCP/TLS handshake to complete.
+    /// Defaults to 800 ms — short enough to fail over from a stalled
+    /// peer quickly without misfiring on regular WAN latency.
+    #[builder(default = Duration::from_millis(800))]
+    pub connect_timeout: Duration,
+    /// Per-request overall timeout. Defaults to five (5) seconds.
+    #[builder(default = Duration::from_secs(5))]
+    pub request_timeout: Duration,
+    /// How long an idle connection may live in the pool before being
+    /// closed. `None` keeps idle connections alive indefinitely so
+    /// subsequent requests reuse the already-warmed HTTP/2 stream.
+    pub pool_idle_timeout: Option<Duration>,
+    /// Maximum number of idle connections per host the pool will retain.
+    /// Defaults to ten (10).
+    #[builder(default = 10_usize)]
+    pub pool_max_idle_per_host: usize,
+    /// When true, the client skips ALPN/HTTP-1.1 upgrade negotiation and
+    /// starts speaking HTTP/2 immediately. Polymarket's CLOB endpoint
+    /// accepts HTTP/2 prior-knowledge connections; this saves one
+    /// round-trip per fresh connection.
+    #[builder(default = true)]
+    pub http2_prior_knowledge: bool,
+    /// HTTP/2 keep-alive PING interval. Defaults to ten (10) seconds —
+    /// frequent enough to detect a half-open TCP connection within
+    /// `http2_keep_alive_timeout` of going silent.
+    #[builder(default = Duration::from_secs(10))]
+    pub http2_keep_alive_interval: Duration,
+    /// HTTP/2 keep-alive PING timeout. Defaults to twenty (20) seconds.
+    /// If no PING ACK arrives within this window the connection is
+    /// considered dead and dropped.
+    #[builder(default = Duration::from_secs(20))]
+    pub http2_keep_alive_timeout: Duration,
+    /// When true, HTTP/2 keep-alive PINGs are sent even on idle
+    /// connections (not only while a request is in flight). Default true.
+    #[builder(default = true)]
+    pub http2_keep_alive_while_idle: bool,
+    /// HTTP/2 initial per-stream flow-control window in bytes.
+    /// Defaults to 512 KiB (`524_288`) so individual responses (especially
+    /// orderbook snapshots) flow without an extra `WINDOW_UPDATE`.
+    #[builder(default = 524_288_u32)]
+    pub http2_initial_stream_window_size: u32,
+    /// HTTP/2 initial connection-wide flow-control window in bytes.
+    /// Defaults to 512 KiB (`524_288`); matches the per-stream window so
+    /// the connection doesn't bottleneck on aggregate throughput.
+    #[builder(default = 524_288_u32)]
+    pub http2_initial_connection_window_size: u32,
+    /// When true (default) sets `TCP_NODELAY` on the socket, disabling
+    /// Nagle's algorithm. Small request payloads (order placement,
+    /// cancels) are sent immediately rather than buffered.
+    #[builder(default = true)]
+    pub tcp_nodelay: bool,
 }
 
 impl Default for Config {
@@ -435,6 +499,17 @@ impl Default for Config {
             builder_code: None,
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
+            connect_timeout: Duration::from_millis(800),
+            request_timeout: Duration::from_secs(5),
+            pool_idle_timeout: None,
+            pool_max_idle_per_host: 10,
+            http2_prior_knowledge: true,
+            http2_keep_alive_interval: Duration::from_secs(10),
+            http2_keep_alive_timeout: Duration::from_secs(20),
+            http2_keep_alive_while_idle: true,
+            http2_initial_stream_window_size: 524_288,
+            http2_initial_connection_window_size: 524_288,
+            tcp_nodelay: true,
         }
     }
 }
@@ -1471,7 +1546,22 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let mut builder = ReqwestClient::builder()
+            .default_headers(headers)
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .tcp_nodelay(config.tcp_nodelay)
+            .http2_keep_alive_interval(Some(config.http2_keep_alive_interval))
+            .http2_keep_alive_timeout(config.http2_keep_alive_timeout)
+            .http2_keep_alive_while_idle(config.http2_keep_alive_while_idle)
+            .http2_initial_stream_window_size(config.http2_initial_stream_window_size)
+            .http2_initial_connection_window_size(config.http2_initial_connection_window_size);
+        if config.http2_prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+        let client = builder.build()?;
 
         let geoblock_host = Url::parse(
             config
@@ -2922,5 +3012,24 @@ mod tests {
     #[test]
     fn client_default_should_succeed() {
         _ = Client::default();
+    }
+
+    /// Pin the Pattern-2 HTTP transport defaults. If anyone changes a
+    /// default without updating callers (e.g. the bot tunes its own
+    /// `Config` based on these values), the change is loud at test time.
+    #[test]
+    fn config_default_http_tuning() {
+        let cfg = Config::default();
+        assert_eq!(cfg.connect_timeout, Duration::from_millis(800));
+        assert_eq!(cfg.request_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.pool_idle_timeout, None);
+        assert_eq!(cfg.pool_max_idle_per_host, 10);
+        assert!(cfg.http2_prior_knowledge);
+        assert_eq!(cfg.http2_keep_alive_interval, Duration::from_secs(10));
+        assert_eq!(cfg.http2_keep_alive_timeout, Duration::from_secs(20));
+        assert!(cfg.http2_keep_alive_while_idle);
+        assert_eq!(cfg.http2_initial_stream_window_size, 524_288);
+        assert_eq!(cfg.http2_initial_connection_window_size, 524_288);
+        assert!(cfg.tcp_nodelay);
     }
 }
