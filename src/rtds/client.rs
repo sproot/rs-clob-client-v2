@@ -288,6 +288,17 @@ impl<S: State> Client<S> {
         let topic = TopicType::new("comments".to_owned(), msg_type);
         self.inner.subscriptions.unsubscribe(&[topic])
     }
+
+    /// Stop the background WebSocket task this client owns.
+    ///
+    /// Drives [`ConnectionManager::shutdown`] on the underlying connection.
+    /// Without this call, dropping the [`Client`] leaves the spawned
+    /// `connection_loop` task parked in `connect_async` / backoff sleep
+    /// until those resolve naturally — callers that budget a short
+    /// shutdown window should `await` this method before exiting.
+    pub async fn shutdown(&self) {
+        self.inner.connection.shutdown().await;
+    }
 }
 
 impl Client<Authenticated<Normal>> {

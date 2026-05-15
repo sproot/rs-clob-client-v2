@@ -422,6 +422,24 @@ impl<S: State> Client<S> {
     pub fn unsubscribe_midpoints(&self, asset_ids: &[U256]) -> Result<()> {
         self.unsubscribe_orderbook(asset_ids)
     }
+
+    /// Stop every background WebSocket task this client owns.
+    ///
+    /// Drives [`ConnectionManager::shutdown`] on every active channel (the
+    /// market and user channels are spawned lazily on first subscription, so
+    /// only initialized channels are walked). The shutdown is `&self`-safe
+    /// and idempotent: clones of [`Client`] share the same `Arc<ClientInner>`,
+    /// and each `ConnectionManager::shutdown` is no-op after the first call.
+    ///
+    /// Without this call, dropping a [`Client`] leaves the spawned
+    /// `connection_loop` tasks parked in `connect_async` / backoff sleep
+    /// until those resolve naturally. Callers that budget a short
+    /// shutdown window should `await` this method before exiting.
+    pub async fn shutdown(&self) {
+        for entry in &self.inner.channels {
+            entry.value().connection.shutdown().await;
+        }
+    }
 }
 
 // Methods only available for authenticated clients

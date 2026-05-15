@@ -1239,6 +1239,62 @@ mod reconnection {
             ),
         }
     }
+
+    /// Pin the [`Client::shutdown`] contract: when the spawned
+    /// `connection_loop` is currently parked inside `connect_async` /
+    /// backoff sleep, calling `shutdown` must drop the task within a
+    /// tight budget so the caller can finish its own graceful shutdown.
+    ///
+    /// Setup: point the client at an unbound TCP port so the first
+    /// `connect_async` call returns `Err`. Then the loop is parked inside
+    /// the long-interval backoff `sleep` and would only check
+    /// `sender_rx.is_closed()` at the top of the next iteration. Without
+    /// the explicit abort introduced in this commit, dropping the
+    /// [`Client`] alone leaves the task parked until the sleep resolves
+    /// naturally; with the abort, the join settles immediately.
+    #[tokio::test]
+    async fn shutdown_cancels_connection_loop_promptly() {
+        // Pick an address that will reliably refuse connections so the
+        // SDK's `connect_async` fails fast. Bind a listener to grab the
+        // port, then drop the listener — the port stays unbound until the
+        // OS reuses it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        // Long backoff so the loop parks deep inside `sleep` after the
+        // first `connect_async` failure. The shutdown must interrupt that
+        // sleep — that is the load-bearing assertion. `Config` and
+        // `ReconnectConfig` are `#[non_exhaustive]` so we mutate the
+        // fields on a default.
+        let mut cfg = Config::default();
+        cfg.disable_heartbeat = true;
+        cfg.reconnect.initial_backoff = Duration::from_secs(60);
+        cfg.reconnect.max_backoff = Duration::from_secs(60);
+
+        let endpoint = format!("ws://{addr}/ws/market");
+        let client = Client::new(&endpoint, cfg).unwrap();
+
+        // Force the lazy channel to spawn its `connection_loop`.
+        let _stream = client
+            .subscribe_orderbook(vec![payloads::asset_id()])
+            .unwrap();
+
+        // Give the loop a moment to issue connect_async, fail, and enter
+        // the backoff sleep.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Shutdown must return within 100ms. Without the JoinHandle::abort
+        // path this would hang for the full 60-second backoff.
+        let started = std::time::Instant::now();
+        let shutdown_result = timeout(Duration::from_millis(100), client.shutdown()).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            shutdown_result.is_ok(),
+            "Client::shutdown() must abort the parked connection_loop within 100ms, took {elapsed:?}"
+        );
+    }
 }
 
 mod unsubscribe {

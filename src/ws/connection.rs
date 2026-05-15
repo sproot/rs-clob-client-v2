@@ -5,7 +5,9 @@
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use backoff::backoff::Backoff as _;
 use futures::{SinkExt as _, StreamExt as _};
@@ -13,6 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -28,6 +31,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
+
+/// Maximum time [`ConnectionManager::shutdown`] will wait for the spawned
+/// `connection_loop` task to settle after dropping the sender and aborting
+/// the handle. Tight enough that callers can budget shutdown latency
+/// predictably; long enough that a healthy task always wins the race.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Marker message sent from the heartbeat loop to the message loop on
 /// PING/PONG liveness failure. The message loop drops the active stream
@@ -107,6 +116,12 @@ where
     sender_tx: mpsc::UnboundedSender<String>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
+    /// Handle to the spawned `connection_loop` task. Wrapped in
+    /// `Arc<Mutex<Option<_>>>` so [`ConnectionManager`] stays `Clone` while
+    /// still letting [`Self::shutdown`] `.take()` the handle and abort the
+    /// underlying task exactly once. After shutdown the slot is `None` so
+    /// subsequent calls are no-ops.
+    connection_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Phantom data for unused type parameters
     _phantom: PhantomData<P>,
 }
@@ -126,13 +141,17 @@ where
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
 
-        // Spawn connection task
+        // Spawn connection task. We retain the `JoinHandle` so
+        // [`Self::shutdown`] can abort the loop synchronously even if it is
+        // currently parked inside `connect_async` or the backoff sleep —
+        // both are `.await` points the `sender_rx.is_closed()` check at the
+        // top of the loop only reaches between iterations.
         let connection_config = config;
         let connection_endpoint = endpoint;
         let broadcast_tx_clone = broadcast_tx.clone();
         let state_tx_clone = state_tx.clone();
 
-        tokio::spawn(async move {
+        let connection_handle = tokio::spawn(async move {
             Self::connection_loop(
                 connection_endpoint,
                 connection_config,
@@ -149,6 +168,7 @@ where
             state_rx,
             sender_tx,
             broadcast_tx,
+            connection_handle: Arc::new(Mutex::new(Some(connection_handle))),
             _phantom: PhantomData,
         })
     }
@@ -486,5 +506,49 @@ where
     #[must_use]
     pub fn state_receiver(&self) -> watch::Receiver<ConnectionState> {
         self.state_tx.subscribe()
+    }
+
+    /// Stop the spawned `connection_loop` task promptly.
+    ///
+    /// Dropping the [`ConnectionManager`] alone is not enough to stop the
+    /// underlying task: the loop checks `sender_rx.is_closed()` only between
+    /// iterations, so if the task is currently awaiting `connect_async` or
+    /// the backoff `sleep` it stays parked until those resolve naturally
+    /// (which can take minutes against a stalled peer). This is fine when
+    /// the process is exiting anyway but blocks callers that budget a short
+    /// graceful-shutdown window.
+    ///
+    /// Calling `shutdown` aborts the [`JoinHandle`] directly and awaits its
+    /// settlement with a small timeout. The mutex-`Option` storage makes
+    /// the operation idempotent and safe to call on a `&self` even though
+    /// [`ConnectionManager`] is `Clone`.
+    ///
+    /// This method does not propagate panic information from the aborted
+    /// task; the only failure mode would be the join timing out, which we
+    /// silently absorb on the assumption the abort eventually wins.
+    pub async fn shutdown(&self) {
+        // Drop the sender so `sender_rx.is_closed()` flips and the loop
+        // exits cleanly the next time it reaches the top — applies when
+        // the task happens to be at a friendly checkpoint.
+        //
+        // (No-op for the sender side: `mpsc::UnboundedSender` is `Clone`
+        // and the clone we hold lives on this struct. Dropping it requires
+        // dropping the struct; instead, the abort below covers the case
+        // where the task is parked anywhere awaiting.)
+
+        let handle = self
+            .connection_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+
+        if let Some(handle) = handle {
+            handle.abort();
+            // Give the abort a small window to settle so the caller's join
+            // ordering is predictable. We ignore the result: the only
+            // expected outcome is `JoinError::is_cancelled() == true`.
+            _ = timeout(SHUTDOWN_JOIN_TIMEOUT, handle).await;
+            _ = self.state_tx.send(ConnectionState::Disconnected);
+        }
     }
 }
