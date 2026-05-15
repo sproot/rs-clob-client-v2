@@ -1038,6 +1038,96 @@ mod reconnection {
             "Should receive best_bid_ask message after reconnection - this was the bug in issue #185"
         );
     }
+
+    /// When the server stops echoing PONG (or never started), the heartbeat
+    /// loop signals `handle_connection` to drop the active stream, which
+    /// triggers the outer `connection_loop` to reconnect via the standard
+    /// retry path. After reconnect, subscriptions replay via the existing
+    /// `start_reconnection_handler`. This pins the new heartbeat-reconnect
+    /// behaviour added on the `polymarket-bot-customizations` branch — the
+    /// upstream `break;` would have left the connection running silently.
+    #[tokio::test]
+    async fn heartbeat_timeout_triggers_reconnect_and_resubscribe() {
+        let mut server = ReconnectableMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+
+        // Tight heartbeat values so the test runs in <1s, plus the short
+        // reconnect backoff from `config()`. The mock server eats PING text
+        // frames without replying — exact mirror of Polymarket's observed
+        // behaviour.
+        let mut cfg = config();
+        cfg.heartbeat_interval = Duration::from_millis(150);
+        cfg.heartbeat_timeout = Duration::from_millis(200);
+
+        let client = Client::new(&endpoint, cfg).unwrap();
+        let asset_id = payloads::asset_id();
+        let stream = client.subscribe_orderbook(vec![asset_id]).unwrap();
+        let mut stream = Box::pin(stream);
+
+        // Initial subscription lands.
+        let initial = server.recv_subscription().await.unwrap();
+        assert!(initial.contains(&asset_id.to_string()));
+
+        // Confirm the stream is live before letting the heartbeat fire.
+        server.send(&payloads::book().to_string());
+        let pre = timeout(Duration::from_secs(2), stream.next()).await;
+        assert!(pre.is_ok(), "should receive message before heartbeat fires");
+
+        // Wait long enough for the heartbeat loop to send a PING and the
+        // timeout to elapse. The disconnect signal raised inside
+        // `handle_connection` returns `WsError::HeartbeatFailure`; the
+        // outer loop reconnects and the SDK replays the active
+        // subscription.
+        let resub = server.recv_subscription().await;
+        assert!(
+            resub.is_some(),
+            "heartbeat timeout should drop the connection and the outer loop should resubscribe"
+        );
+        assert!(resub.unwrap().contains(&asset_id.to_string()));
+
+        // Messages flow on the reused stream handle after reconnect — the
+        // broadcast channel survives across reconnect.
+        server.send(&payloads::book().to_string());
+        let post = timeout(Duration::from_secs(2), stream.next()).await;
+        assert!(
+            post.is_ok() && post.unwrap().is_some(),
+            "should receive message after heartbeat-driven reconnect"
+        );
+    }
+
+    /// With `disable_heartbeat = true`, the heartbeat loop is not spawned
+    /// at all; the connection lives until a real `Message::Close` or
+    /// transport error arrives. We assert that the absence of PONG does
+    /// NOT trigger a reconnect within a window that comfortably exceeds
+    /// the default heartbeat timeout — proving the knob takes effect.
+    #[tokio::test]
+    async fn disable_heartbeat_skips_reconnect_on_pong_silence() {
+        let mut server = ReconnectableMockServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+
+        // Aggressive interval/timeout that WOULD trigger a reconnect if the
+        // heartbeat task were spawned. With `disable_heartbeat = true` they
+        // are ignored entirely.
+        let mut cfg = config();
+        cfg.disable_heartbeat = true;
+        cfg.heartbeat_interval = Duration::from_millis(50);
+        cfg.heartbeat_timeout = Duration::from_millis(100);
+
+        let client = Client::new(&endpoint, cfg).unwrap();
+        let asset_id = payloads::asset_id();
+        let _stream = client.subscribe_orderbook(vec![asset_id]).unwrap();
+        let initial = server.recv_subscription().await.unwrap();
+        assert!(initial.contains(&asset_id.to_string()));
+
+        // Wait several heartbeat windows. With heartbeat enabled, this is
+        // enough time for ~5 PING/PONG-failure reconnects; here we expect
+        // exactly zero re-subscription messages.
+        let resub = timeout(Duration::from_millis(800), server.recv_subscription()).await;
+        assert!(
+            resub.is_err(),
+            "disable_heartbeat must keep the connection alive across the heartbeat window"
+        );
+    }
 }
 
 mod unsubscribe {

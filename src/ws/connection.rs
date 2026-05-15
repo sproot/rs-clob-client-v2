@@ -29,6 +29,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// Marker message sent from the heartbeat loop to the message loop on
+/// PING/PONG liveness failure. The message loop drops the active stream
+/// in response so `connection_loop` reconnects.
+#[derive(Debug, Clone, Copy)]
+struct HeartbeatDisconnect;
+
 /// Connection state tracking.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,10 +244,27 @@ where
         // Channel to notify heartbeat loop when PONG is received
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        // Disconnect signal raised by the heartbeat loop on PONG failure
+        // (or other liveness failure). Capacity 1 — only the first signal
+        // matters; subsequent signals are coalesced.
+        let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<HeartbeatDisconnect>(1);
 
-        let heartbeat_handle = tokio::spawn(async move {
-            Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
-        });
+        // Spawn the heartbeat loop only when enabled. With `disable_heartbeat`
+        // set we still need a `JoinHandle` to abort on shutdown; we spawn a
+        // task that simply waits forever on a never-resolving future so the
+        // existing `.abort()` cleanup path keeps working.
+        let heartbeat_handle = if config.disable_heartbeat {
+            tokio::spawn(async move {
+                // Park the task until aborted by the message loop's cleanup.
+                std::future::pending::<()>().await;
+            })
+        } else {
+            let disconnect_tx_clone = disconnect_tx.clone();
+            tokio::spawn(async move {
+                Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx, disconnect_tx_clone)
+                    .await;
+            })
+        };
 
         loop {
             tokio::select! {
@@ -306,6 +329,17 @@ where
                     }
                 }
 
+                // Heartbeat loop reported a stale PONG / PING timeout — drop
+                // the active stream and surface a HeartbeatFailure so the
+                // outer connection_loop reconnects through its normal path.
+                Some(_signal) = disconnect_rx.recv() => {
+                    heartbeat_handle.abort();
+                    return Err(Error::with_source(
+                        Kind::WebSocket,
+                        WsError::HeartbeatFailure,
+                    ));
+                }
+
                 // Check if connection is still active
                 else => {
                     break;
@@ -320,11 +354,20 @@ where
     }
 
     /// Heartbeat loop that sends PING messages and monitors PONG responses.
+    ///
+    /// On any liveness failure (PONG timeout, stale PONG, or sender channel
+    /// closed) the loop notifies `disconnect_tx` so [`Self::handle_connection`]
+    /// drops the active WebSocket stream and the outer [`Self::connection_loop`]
+    /// reconnects via the standard exponential-backoff retry path. Without
+    /// this signal the loop's earlier `break;` would leave the connection
+    /// running without any liveness probe until a hard `Message::Close` or
+    /// transport error fired.
     async fn heartbeat_loop(
         ping_tx: mpsc::UnboundedSender<()>,
         state_rx: watch::Receiver<ConnectionState>,
         config: &Config,
         mut pong_rx: watch::Receiver<Instant>,
+        disconnect_tx: mpsc::Sender<HeartbeatDisconnect>,
     ) {
         let mut ping_interval = interval(config.heartbeat_interval);
 
@@ -343,7 +386,7 @@ where
             // Send PING request to message loop
             let ping_sent = Instant::now();
             if ping_tx.send(()).is_err() {
-                // Message loop has terminated
+                // Message loop has terminated; nothing to signal.
                 break;
             }
 
@@ -355,23 +398,27 @@ where
                     let last_pong = *pong_rx.borrow_and_update();
                     if last_pong < ping_sent {
                         #[cfg(feature = "tracing")]
-                        tracing::debug!(
-                            "PONG received but older than last PING, connection may be stale"
+                        tracing::warn!(
+                            "Heartbeat stale: PONG received but older than last PING, dropping connection for reconnect"
                         );
+                        _ = disconnect_tx.try_send(HeartbeatDisconnect);
                         break;
                     }
                 }
                 Ok(Err(_)) => {
-                    // Channel closed, connection is terminating
+                    // pong_rx channel closed — the message loop is going
+                    // away. The outer task will tear us down; no need to
+                    // signal a reconnect.
                     break;
                 }
                 Err(_) => {
                     // Timeout waiting for PONG
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
-                        "Heartbeat timeout: no PONG received within {:?}",
+                        "Heartbeat timeout: no PONG received within {:?}, dropping connection for reconnect",
                         config.heartbeat_timeout
                     );
+                    _ = disconnect_tx.try_send(HeartbeatDisconnect);
                     break;
                 }
             }

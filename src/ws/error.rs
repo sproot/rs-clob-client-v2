@@ -24,6 +24,9 @@ pub enum WsError {
     Timeout,
     /// Received an invalid or unexpected message
     InvalidMessage(String),
+    /// Heartbeat (PING/PONG) timed out or detected a stale connection;
+    /// the connection has been signaled to reconnect.
+    HeartbeatFailure,
 }
 
 impl fmt::Display for WsError {
@@ -36,6 +39,10 @@ impl fmt::Display for WsError {
             Self::ConnectionClosed => write!(f, "WebSocket connection closed"),
             Self::Timeout => write!(f, "WebSocket operation timed out"),
             Self::InvalidMessage(msg) => write!(f, "Invalid WebSocket message: {msg}"),
+            Self::HeartbeatFailure => write!(
+                f,
+                "WebSocket heartbeat failed; connection signaled for reconnect"
+            ),
         }
     }
 }

@@ -21,6 +21,14 @@ pub struct Config {
     pub heartbeat_interval: Duration,
     /// Maximum time to wait for PONG response before considering connection dead
     pub heartbeat_timeout: Duration,
+    /// When true, the application-level PING/PONG heartbeat is skipped
+    /// entirely. Useful for servers that do not echo `Message::Text("PONG")`
+    /// — in that case the heartbeat would either log spurious WARNs or
+    /// (with reconnect-on-failure semantics) trigger a reconnect storm.
+    /// Real disconnects are still detected via `Message::Close` / network
+    /// errors in the message loop, plus HTTP/2 keep-alive frames at the
+    /// transport layer.
+    pub disable_heartbeat: bool,
     /// Reconnection strategy configuration
     pub reconnect: ReconnectConfig,
 }
@@ -30,6 +38,7 @@ impl Default for Config {
         Self {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL_DURATION,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
+            disable_heartbeat: false,
             reconnect: ReconnectConfig::default(),
         }
     }
