@@ -68,7 +68,8 @@ impl ConnectionState {
 /// This generic connection manager handles all WebSocket connection concerns:
 /// - Establishing and maintaining connections
 /// - Automatic reconnection with exponential backoff
-/// - Heartbeat monitoring via PING/PONG
+/// - Heartbeat monitoring via WS-protocol Ping/Pong frames (RFC 6455
+///   opcodes 0x9/0xA), which compliant servers MUST acknowledge
 /// - Broadcasting messages to multiple subscribers
 ///
 /// # Type Parameters
@@ -271,7 +272,13 @@ where
                 // Handle incoming messages
                 Some(msg) = read.next() => {
                     match msg {
-                        Ok(Message::Text(text)) if text == "PONG" => {
+                        // WS-protocol Pong frame (opcode 0xA), the server's
+                        // automatic reply to our heartbeat Ping. tungstenite
+                        // surfaces incoming Pong frames as `Message::Pong`
+                        // stream items; consume them and refresh the watch
+                        // channel so the heartbeat loop's `pong_rx.changed()`
+                        // unblocks.
+                        Ok(Message::Pong(_)) => {
                             _ = pong_tx.send(Instant::now());
                         }
                         Ok(Message::Text(text)) => {
@@ -310,7 +317,10 @@ where
                             ));
                         }
                         _ => {
-                            // Ignore binary frames and unsolicited PONG replies.
+                            // Ignore binary frames and any other unsolicited
+                            // message types. Incoming Ping frames are handled
+                            // by tokio-tungstenite at the protocol layer
+                            // (auto-Pong reply) before they reach us here.
                         }
                     }
                 }
@@ -322,9 +332,14 @@ where
                     }
                 }
 
-                // Handle PING requests from heartbeat loop
+                // Handle PING requests from heartbeat loop. Emits a
+                // WS-protocol Ping frame (opcode 0x9) rather than an
+                // application-level Text("PING"). Per RFC 6455 servers
+                // are required to respond with a Pong frame (opcode 0xA)
+                // carrying the same payload; tokio-tungstenite handles
+                // the inbound side automatically.
                 Some(()) = ping_rx.recv() => {
-                    if write.send(Message::Text("PING".into())).await.is_err() {
+                    if write.send(Message::Ping(Vec::new().into())).await.is_err() {
                         break;
                     }
                 }
@@ -353,15 +368,17 @@ where
         Ok(())
     }
 
-    /// Heartbeat loop that sends PING messages and monitors PONG responses.
+    /// Heartbeat loop that sends WS-protocol Ping frames and monitors Pong
+    /// responses.
     ///
-    /// On any liveness failure (PONG timeout, stale PONG, or sender channel
-    /// closed) the loop notifies `disconnect_tx` so [`Self::handle_connection`]
-    /// drops the active WebSocket stream and the outer [`Self::connection_loop`]
-    /// reconnects via the standard exponential-backoff retry path. Without
-    /// this signal the loop's earlier `break;` would leave the connection
-    /// running without any liveness probe until a hard `Message::Close` or
-    /// transport error fired.
+    /// Each tick triggers a `Message::Ping` send from
+    /// [`Self::handle_connection`] (opcode 0x9, RFC 6455). The server MUST
+    /// reply with a `Message::Pong` frame (opcode 0xA); the message loop
+    /// catches the inbound Pong and refreshes `pong_rx`. On any liveness
+    /// failure (Pong timeout, stale Pong, or sender channel closed) the
+    /// loop notifies `disconnect_tx` so [`Self::handle_connection`] drops
+    /// the active WebSocket stream and the outer [`Self::connection_loop`]
+    /// reconnects via the standard exponential-backoff retry path.
     async fn heartbeat_loop(
         ping_tx: mpsc::UnboundedSender<()>,
         state_rx: watch::Receiver<ConnectionState>,
@@ -399,7 +416,7 @@ where
                     if last_pong < ping_sent {
                         #[cfg(feature = "tracing")]
                         tracing::warn!(
-                            "Heartbeat stale: PONG received but older than last PING, dropping connection for reconnect"
+                            "Heartbeat stale: Pong received but older than last Ping, dropping connection for reconnect"
                         );
                         _ = disconnect_tx.try_send(HeartbeatDisconnect);
                         break;
@@ -412,10 +429,10 @@ where
                     break;
                 }
                 Err(_) => {
-                    // Timeout waiting for PONG
+                    // Timeout waiting for Pong frame
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
-                        "Heartbeat timeout: no PONG received within {:?}, dropping connection for reconnect",
+                        "Heartbeat timeout: no Pong received within {:?}, dropping connection for reconnect",
                         config.heartbeat_timeout
                     );
                     _ = disconnect_tx.try_send(HeartbeatDisconnect);

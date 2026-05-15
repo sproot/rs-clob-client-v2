@@ -60,10 +60,16 @@ impl MockWsServer {
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            // Handle incoming messages from client
+                            // Handle incoming messages from client. Ping
+                            // frames now travel at the WS protocol layer
+                            // (opcode 0x9) — tokio-tungstenite handles the
+                            // automatic Pong reply internally, so we only
+                            // see them surface here as `Message::Ping(_)`
+                            // stream items that fall through to the
+                            // catch-all branch.
                             msg = read.next() => {
                                 match msg {
-                                    Some(Ok(Message::Text(text))) if text != "PING" => {
+                                    Some(Ok(Message::Text(text))) => {
                                         drop(sub_tx.send(text.to_string()));
                                     }
                                     Some(Ok(_)) => {}
@@ -747,6 +753,20 @@ mod reconnection {
 
     impl ReconnectableMockServer {
         async fn start() -> Self {
+            Self::start_inner(false).await
+        }
+
+        /// Variant that stops polling the read half after capturing the
+        /// first subscription text. Without active reads, tokio-tungstenite
+        /// never processes inbound Ping frames, so it never queues the
+        /// automatic Pong reply — the bot's heartbeat loop times out as
+        /// intended. Used by `heartbeat_timeout_triggers_reconnect_and_resubscribe`
+        /// to simulate Polymarket V2's silence on heartbeat probes.
+        async fn start_silent_after_subscribe() -> Self {
+            Self::start_inner(true).await
+        }
+
+        async fn start_inner(silent_after_subscribe: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
@@ -773,15 +793,24 @@ mod reconnection {
                     let disconnect_clone = Arc::clone(&disconnect);
 
                     tokio::spawn(async move {
+                        let mut subscribed = false;
                         loop {
                             if disconnect_clone.load(Ordering::SeqCst) {
                                 break;
                             }
 
+                            // After the first subscription text is captured,
+                            // the silent-after-subscribe variant stops polling
+                            // the read half so tokio-tungstenite cannot
+                            // surface (and auto-Pong) any subsequent inbound
+                            // Ping frames.
+                            let read_disabled = silent_after_subscribe && subscribed;
+
                             tokio::select! {
-                                msg = read.next() => {
+                                msg = read.next(), if !read_disabled => {
                                     match msg {
-                                        Some(Ok(Message::Text(text))) if text != "PING" => {
+                                        Some(Ok(Message::Text(text))) => {
+                                            subscribed = true;
                                             drop(sub_tx.send(text.to_string()));
                                         }
                                         Some(Ok(_)) => {}
@@ -1039,22 +1068,29 @@ mod reconnection {
         );
     }
 
-    /// When the server stops echoing PONG (or never started), the heartbeat
-    /// loop signals `handle_connection` to drop the active stream, which
-    /// triggers the outer `connection_loop` to reconnect via the standard
-    /// retry path. After reconnect, subscriptions replay via the existing
-    /// `start_reconnection_handler`. This pins the new heartbeat-reconnect
-    /// behaviour added on the `polymarket-bot-customizations` branch — the
-    /// upstream `break;` would have left the connection running silently.
+    /// When the server fails to respond to heartbeat Ping frames, the
+    /// heartbeat loop signals `handle_connection` to drop the active
+    /// stream, which triggers the outer `connection_loop` to reconnect
+    /// via the standard retry path. After reconnect, subscriptions replay
+    /// via the existing `start_reconnection_handler`. This pins the new
+    /// heartbeat-reconnect behaviour added on the
+    /// `polymarket-bot-customizations` branch — the upstream `break;`
+    /// would have left the connection running silently.
+    ///
+    /// Uses `start_silent_after_subscribe` because tokio-tungstenite
+    /// automatically queues a Pong reply at the protocol layer whenever
+    /// it processes an inbound Ping. A naive mock server that polls its
+    /// read half would auto-Pong and the heartbeat would never time out.
     #[tokio::test]
     async fn heartbeat_timeout_triggers_reconnect_and_resubscribe() {
-        let mut server = ReconnectableMockServer::start().await;
+        let mut server = ReconnectableMockServer::start_silent_after_subscribe().await;
         let endpoint = server.ws_url("/ws/market");
 
         // Tight heartbeat values so the test runs in <1s, plus the short
-        // reconnect backoff from `config()`. The mock server eats PING text
-        // frames without replying — exact mirror of Polymarket's observed
-        // behaviour.
+        // reconnect backoff from `config()`. The mock server stops polling
+        // its read half after the initial subscription so inbound Ping
+        // frames never get an auto-Pong reply — mirroring Polymarket's
+        // observed silence on heartbeat probes.
         let mut cfg = config();
         cfg.heartbeat_interval = Duration::from_millis(150);
         cfg.heartbeat_timeout = Duration::from_millis(200);
@@ -1097,12 +1133,16 @@ mod reconnection {
 
     /// With `disable_heartbeat = true`, the heartbeat loop is not spawned
     /// at all; the connection lives until a real `Message::Close` or
-    /// transport error arrives. We assert that the absence of PONG does
-    /// NOT trigger a reconnect within a window that comfortably exceeds
-    /// the default heartbeat timeout — proving the knob takes effect.
+    /// transport error arrives. We assert that an unresponsive heartbeat
+    /// channel does NOT trigger a reconnect within a window that
+    /// comfortably exceeds the default heartbeat timeout — proving the
+    /// knob takes effect. The mock server stops polling its read half
+    /// after subscription so it cannot auto-Pong, but with
+    /// `disable_heartbeat = true` no Ping frame is sent in the first
+    /// place; the test simply runs out the clock.
     #[tokio::test]
     async fn disable_heartbeat_skips_reconnect_on_pong_silence() {
-        let mut server = ReconnectableMockServer::start().await;
+        let mut server = ReconnectableMockServer::start_silent_after_subscribe().await;
         let endpoint = server.ws_url("/ws/market");
 
         // Aggressive interval/timeout that WOULD trigger a reconnect if the
@@ -1127,6 +1167,77 @@ mod reconnection {
             resub.is_err(),
             "disable_heartbeat must keep the connection alive across the heartbeat window"
         );
+    }
+
+    /// Pins the move from app-level `Message::Text("PING")` to WS-protocol
+    /// `Message::Ping(_)` frames (RFC 6455 opcode 0x9). A regression that
+    /// reintroduces text-based heartbeat would silently break Polymarket
+    /// V2 compatibility because the V2 servers do not echo
+    /// `Message::Text("PONG")`. The mock server runs its own handshake
+    /// loop and captures the first non-subscription frame received from
+    /// the client; with the protocol-level heartbeat that frame is a Ping.
+    #[tokio::test]
+    async fn heartbeat_uses_ws_protocol_ping_not_app_text() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Channel for the captured first non-subscription frame.
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Message>();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+
+            let (_write, mut read) = ws_stream.split();
+
+            // First Text frame is the subscription. Anything after that is
+            // forwarded to the test. The first follow-up frame is the
+            // heartbeat probe — we expect a Ping, not a Text.
+            let mut subscribed = false;
+            while let Some(msg) = read.next().await {
+                let Ok(msg) = msg else {
+                    break;
+                };
+                if matches!(msg, Message::Text(_)) && !subscribed {
+                    subscribed = true;
+                    continue;
+                }
+                let send_result = frame_tx.send(msg);
+                if send_result.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let endpoint = format!("ws://{addr}/ws/market");
+
+        // Heartbeat interval short enough that the probe fires within the
+        // test window. Timeout doesn't matter — we only care about the
+        // outbound frame type. Reconnect backoff matters even less.
+        let mut cfg = config();
+        cfg.heartbeat_interval = Duration::from_millis(100);
+        cfg.heartbeat_timeout = Duration::from_secs(5);
+
+        let client = Client::new(&endpoint, cfg).unwrap();
+        let asset_id = payloads::asset_id();
+        let _stream = client.subscribe_orderbook(vec![asset_id]).unwrap();
+
+        // Wait for the heartbeat to surface the first follow-up frame.
+        let first_follow_up = timeout(Duration::from_secs(2), frame_rx.recv())
+            .await
+            .expect("heartbeat probe should land within 2s of subscription")
+            .expect("frame channel should not be closed before a frame arrives");
+
+        match first_follow_up {
+            Message::Ping(_) => {}
+            other => panic!(
+                "expected WS-protocol Ping frame (opcode 0x9) as heartbeat probe, got: {other:?}"
+            ),
+        }
     }
 }
 
