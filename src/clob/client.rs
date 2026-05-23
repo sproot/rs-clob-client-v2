@@ -747,7 +747,22 @@ impl<S: State> Client<S> {
     /// offline / test scenarios.
     ///
     /// `version` is stored verbatim — pass `1` for V1 and `2` for V2.
+    ///
+    /// # Panics (debug builds)
+    ///
+    /// `0` is the in-band cache-miss sentinel that `resolve_version`
+    /// checks before issuing the `/version` HTTP probe (see
+    /// [`Self::resolve_version`]). Storing `0` here would silently
+    /// undo any prior priming and re-arm the lazy fetch, defeating the
+    /// purpose of the setter. Debug builds assert the version is `1`
+    /// or `2` (the only protocol generations the SDK negotiates); the
+    /// assert is dropped in release builds so misuse is loud in tests
+    /// without adding a runtime check on the hot path.
     pub fn set_cached_version(&self, version: u32) {
+        debug_assert!(
+            version == 1 || version == 2,
+            "cached_version must be 1 or 2; 0 is the cache-miss sentinel and other values pin the SDK to a non-existent protocol generation (got {version})",
+        );
         self.inner
             .cached_version
             .store(version, Ordering::Relaxed);
