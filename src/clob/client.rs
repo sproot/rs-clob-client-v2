@@ -727,6 +727,32 @@ impl<S: State> Client<S> {
         self.inner.fee_rate_bps.insert(token_id, fee_rate);
     }
 
+    /// Pre-populates the V2 fee-info cache for a token, avoiding the
+    /// `/clob-markets/{id}` HTTP call that `fee_info(...)` would
+    /// otherwise issue. Mirrors [`Self::set_tick_size`] /
+    /// [`Self::set_neg_risk`] / [`Self::set_fee_rate`] in shape: a
+    /// public setter for an otherwise-internal cache, used by callers
+    /// that already hold the canonical data from another source
+    /// (for example, an offline test harness or a multi-client
+    /// deployment that primes the cache from a shared upstream).
+    pub fn set_fee_info(&self, token_id: U256, fee_info: crate::clob::types::response::FeeInfo) {
+        self.inner.fee_infos.insert(token_id, fee_info);
+    }
+
+    /// Pre-populates the CLOB protocol-version cache, avoiding the
+    /// `/version` HTTP probe that `resolve_version(false)` issues on
+    /// the first build / sign / post call. Useful for callers that
+    /// know the negotiated version from a previous run or want to
+    /// force the SDK onto a specific protocol generation for
+    /// offline / test scenarios.
+    ///
+    /// `version` is stored verbatim — pass `1` for V1 and `2` for V2.
+    pub fn set_cached_version(&self, version: u32) {
+        self.inner
+            .cached_version
+            .store(version, Ordering::Relaxed);
+    }
+
     /// Checks if the CLOB API is healthy and operational.
     ///
     /// Returns "OK" if the API is functioning properly. This method is useful
