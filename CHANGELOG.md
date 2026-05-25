@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — polymarket-bot-customizations branch
+
+### Changed (breaking)
+
+- `clob::types::response::TradeResponse.fee_rate_bps`:
+  `Decimal` → `Option<Decimal>`. Empty string `""`, `null`, and
+  missing field all deserialize to `None`. Valid decimal /
+  scientific-notation strings deserialize to `Some(Decimal)`.
+- `clob::types::response::MakerOrder.fee_rate_bps`: same change.
+
+### Reason
+
+The Polymarket v2 `/data/trades` REST endpoint returns
+`fee_rate_bps: ""` for orders whose maker-side fee is unknown or
+not applicable (V2 derives fees at match time rather than from
+the signed order). The previous `Decimal` type rejected the
+empty string and failed entire response pages. The new
+`Option<Decimal>` makes the absence representable instead of an
+error.
+
+### Migration
+
+Callers that read `fee_rate_bps` must handle `None` explicitly.
+To preserve old behavior in a single call site, replace
+`trade.fee_rate_bps` with
+`trade.fee_rate_bps.unwrap_or(Decimal::ZERO)` — but prefer
+propagating the `Option` so missing fees are not silently
+accounted as zero.
+
 ## [Unreleased]
 
 ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
