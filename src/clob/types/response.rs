@@ -970,6 +970,19 @@ mod maker_order_tests {
         let result: Result<MakerOrder, _> = serde_json::from_str(&json);
         result.unwrap_err();
     }
+
+    #[test]
+    fn maker_order_deserializes_with_scientific_notation_fee_rate_bps() {
+        // Regression: rust_decimal's default visitor accepts `"9.7e-7"` via
+        // its `from_scientific` fallback. The custom helper must preserve
+        // that to avoid failing whole pages on exotic but valid encodings.
+        let json = maker_order_json(Some(r#""9.7e-7""#));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(
+            mo.fee_rate_bps,
+            Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1041,5 +1054,19 @@ mod trade_response_tests {
         let json = trade_response_json(Some(r#""not_a_number""#));
         let result: Result<TradeResponse, _> = serde_json::from_str(&json);
         result.unwrap_err();
+    }
+
+    #[test]
+    fn trade_response_deserializes_with_scientific_notation_fee_rate_bps() {
+        // Regression: rust_decimal's default visitor accepts `"9.7e-7"` via
+        // its `from_scientific` fallback. The custom helper must preserve
+        // that to avoid failing whole `/data/trades` pages on exotic but
+        // valid encodings.
+        let json = trade_response_json(Some(r#""9.7e-7""#));
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(
+            tr.fee_rate_bps,
+            Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+        );
     }
 }

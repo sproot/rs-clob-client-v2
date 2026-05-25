@@ -86,9 +86,11 @@ impl serde_with::SerializeAs<String> for StringFromAny {
 /// Polymarket's REST `/data/trades` endpoint intermittently returns
 /// `"fee_rate_bps": ""` (empty string) inside trade entries. The default
 /// `Decimal` deserializer fails on `""`, so we explicitly map empty strings to
-/// `None`. Non-empty strings still parse via `Decimal::from_str`, propagating
-/// the error on unparsable input — this helper does *not* silently swallow
-/// arbitrary garbage.
+/// `None`. Non-empty strings still parse via the same path
+/// `rust_decimal`'s own visitor uses
+/// (`Decimal::from_str` with a `Decimal::from_scientific` fallback so values
+/// like `"9.7e-7"` keep working), propagating the error only when both parses
+/// fail — this helper does *not* silently swallow arbitrary garbage.
 ///
 /// Use with `#[serde_as(as = "OptionalDecimalFromEmptyString")]` on an
 /// `Option<Decimal>` field, paired with `#[serde(default)]` so a missing key
@@ -129,7 +131,14 @@ impl<'de> serde_with::DeserializeAs<'de, Option<crate::types::Decimal>>
                 if v.is_empty() {
                     Ok(None)
                 } else {
-                    Decimal::from_str(v).map(Some).map_err(E::custom)
+                    // Mirror `rust_decimal`'s own serde visitor: try `from_str`
+                    // first, fall back to `from_scientific` so encodings like
+                    // `"9.7e-7"` or `"5e0"` keep deserializing as they did
+                    // before this helper existed.
+                    Decimal::from_str(v)
+                        .or_else(|_| Decimal::from_scientific(v))
+                        .map(Some)
+                        .map_err(E::custom)
                 }
             }
 
@@ -761,6 +770,36 @@ mod tests {
             assert_eq!(
                 result.value,
                 Some(Decimal::try_from(0.5).expect("0.5 fits in Decimal"))
+            );
+        }
+
+        #[test]
+        fn decodes_scientific_notation_string() {
+            // Regression: `rust_decimal`'s default visitor falls back to
+            // `Decimal::from_scientific` when `from_str` fails, so values like
+            // `"9.7e-7"` used to deserialize fine. The helper must preserve
+            // that contract — otherwise one such fee would fail an entire
+            // `/data/trades` page.
+            let json = serde_json::json!({ "value": "9.7e-7" });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(
+                result.value,
+                Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+            );
+        }
+
+        #[test]
+        fn decodes_simple_exponent_form() {
+            // `"5e0"` is not parseable by `Decimal::from_str` but the
+            // scientific fallback handles it and yields exactly 5.
+            use std::str::FromStr as _;
+            let json = serde_json::json!({ "value": "5e0" });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(
+                result.value,
+                Some(Decimal::from_str("5").expect("valid decimal"))
             );
         }
 
