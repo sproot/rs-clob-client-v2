@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::auth::ApiKey;
 use crate::clob::types::{OrderStatusType, OrderType, Side, TickSize, TradeStatusType, TraderSide};
-use crate::serde_helpers::StringFromAny;
+use crate::serde_helpers::{OptionalDecimalFromEmptyString, StringFromAny};
 use crate::types::{Address, B256, Decimal, U256};
 
 #[non_exhaustive]
@@ -510,6 +510,7 @@ pub struct UserInfo {
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Builder, PartialEq)]
 #[builder(on(String, into))]
 pub struct MakerOrder {
@@ -518,7 +519,11 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
-    pub fee_rate_bps: Decimal,
+    /// Fee rate in basis points. `None` when the API returns an empty string
+    /// (`""`) — semantically "fee unknown", distinct from a zero fee.
+    #[serde(default)]
+    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
+    pub fee_rate_bps: Option<Decimal>,
     pub asset_id: U256,
     pub outcome: String,
     pub side: Side,
@@ -898,4 +903,67 @@ pub struct RfqQuote {
     pub size_out: Decimal,
     /// Quoted price.
     pub price: Decimal,
+}
+
+#[cfg(test)]
+mod maker_order_tests {
+    use super::MakerOrder;
+    use crate::types::Decimal;
+
+    /// Build a `MakerOrder` JSON document. The `fee_rate_bps` slot is interpolated
+    /// raw so callers can supply a quoted string, a JSON literal, `null`, or omit
+    /// the key entirely (pass `None`).
+    fn maker_order_json(fee_rate_bps: Option<&str>) -> String {
+        let fee_field = match fee_rate_bps {
+            Some(v) => format!(",\"fee_rate_bps\":{v}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "order_id": "maker_001",
+                "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "maker_address": "0x4444444444444444444444444444444444444444",
+                "matched_amount": "5.0",
+                "price": "0.42",
+                "asset_id": "1",
+                "outcome": "YES",
+                "side": "SELL"{fee_field}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_empty_string_fee_rate_bps() {
+        let json = maker_order_json(Some(r#""""#));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(mo.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_null_fee_rate_bps() {
+        let json = maker_order_json(Some("null"));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(mo.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_missing_fee_rate_bps() {
+        let json = maker_order_json(None);
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(mo.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_valid_decimal_fee_rate_bps() {
+        let json = maker_order_json(Some(r#""10""#));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(mo.fee_rate_bps, Some(Decimal::from(10)));
+    }
+
+    #[test]
+    fn maker_order_fails_on_invalid_non_empty_string_fee_rate_bps() {
+        let json = maker_order_json(Some(r#""not_a_number""#));
+        let result: Result<MakerOrder, _> = serde_json::from_str(&json);
+        result.unwrap_err();
+    }
 }

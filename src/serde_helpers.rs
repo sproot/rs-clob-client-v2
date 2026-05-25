@@ -80,6 +80,99 @@ impl serde_with::SerializeAs<String> for StringFromAny {
     }
 }
 
+/// A `serde_as` type that deserializes a `Decimal` from a JSON string, treating
+/// missing / `null` / empty-string `""` inputs as `None`.
+///
+/// Polymarket's REST `/data/trades` endpoint intermittently returns
+/// `"fee_rate_bps": ""` (empty string) inside trade entries. The default
+/// `Decimal` deserializer fails on `""`, so we explicitly map empty strings to
+/// `None`. Non-empty strings still parse via `Decimal::from_str`, propagating
+/// the error on unparsable input — this helper does *not* silently swallow
+/// arbitrary garbage.
+///
+/// Use with `#[serde_as(as = "OptionalDecimalFromEmptyString")]` on an
+/// `Option<Decimal>` field, paired with `#[serde(default)]` so a missing key
+/// also yields `None`.
+#[cfg(feature = "clob")]
+pub struct OptionalDecimalFromEmptyString;
+
+#[cfg(feature = "clob")]
+impl<'de> serde_with::DeserializeAs<'de, Option<crate::types::Decimal>>
+    for OptionalDecimalFromEmptyString
+{
+    fn deserialize_as<D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<crate::types::Decimal>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use std::fmt;
+        use std::str::FromStr as _;
+
+        use serde::de::{self, Visitor};
+
+        use crate::types::Decimal;
+
+        struct OptionalDecimalVisitor;
+
+        impl Visitor<'_> for OptionalDecimalVisitor {
+            type Value = Option<Decimal>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a decimal-encoded string, empty string, null, or number")
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v.is_empty() {
+                    Ok(None)
+                } else {
+                    Decimal::from_str(v).map(Some).map_err(E::custom)
+                }
+            }
+
+            fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&v)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(Some(Decimal::from(v)))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(Some(Decimal::from(v)))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Decimal::try_from(v).map(Some).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(OptionalDecimalVisitor)
+    }
+}
+
 /// Deserialize JSON with unknown field warnings.
 ///
 /// This function deserializes JSON to a target type while detecting and logging
@@ -590,6 +683,101 @@ mod tests {
             let result: StringFromAnyStruct =
                 serde_json::from_value(json).expect("deserialization failed");
             assert_eq!(result.id, "");
+        }
+    }
+
+    // ========== OptionalDecimalFromEmptyString tests ==========
+    #[cfg(feature = "clob")]
+    mod optional_decimal_from_empty_string_tests {
+        use serde::Deserialize;
+        use serde_with::serde_as;
+
+        use super::super::OptionalDecimalFromEmptyString;
+        use crate::types::Decimal;
+
+        #[serde_as]
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct OptionalDecimalStruct {
+            #[serde(default)]
+            #[serde_as(as = "OptionalDecimalFromEmptyString")]
+            value: Option<Decimal>,
+        }
+
+        #[test]
+        fn decodes_empty_string_as_none() {
+            let json = serde_json::json!({ "value": "" });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, None);
+        }
+
+        #[test]
+        fn decodes_null_as_none() {
+            let json = serde_json::json!({ "value": null });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, None);
+        }
+
+        #[test]
+        fn decodes_missing_field_as_none() {
+            let json = serde_json::json!({});
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, None);
+        }
+
+        #[test]
+        fn decodes_valid_decimal_string_as_some() {
+            let json = serde_json::json!({ "value": "10" });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, Some(Decimal::from(10)));
+        }
+
+        #[test]
+        fn decodes_zero_decimal_string_as_some_zero() {
+            // Anti-regression: "0" must NOT collapse to None — a zero fee is a
+            // real value, distinct from "fee unknown".
+            let json = serde_json::json!({ "value": "0" });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, Some(Decimal::ZERO));
+        }
+
+        #[test]
+        fn decodes_unquoted_integer_as_some() {
+            let json = serde_json::json!({ "value": 42 });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, Some(Decimal::from(42)));
+        }
+
+        #[test]
+        fn decodes_unquoted_float_as_some() {
+            let json = serde_json::json!({ "value": 0.5 });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(
+                result.value,
+                Some(Decimal::try_from(0.5).expect("0.5 fits in Decimal"))
+            );
+        }
+
+        #[test]
+        fn rejects_invalid_non_empty_string() {
+            let json = serde_json::json!({ "value": "not_a_number" });
+            let result: Result<OptionalDecimalStruct, _> = serde_json::from_value(json);
+            result.unwrap_err();
+        }
+
+        #[test]
+        fn rejects_unparsable_float() {
+            // 1e308 exceeds Decimal's representable range, so `Decimal::try_from`
+            // surfaces a conversion error rather than silently producing `None`.
+            let json = serde_json::json!({ "value": 1e308_f64 });
+            let result: Result<OptionalDecimalStruct, _> = serde_json::from_value(json);
+            result.unwrap_err();
         }
     }
 
