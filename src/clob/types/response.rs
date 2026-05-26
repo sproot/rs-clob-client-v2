@@ -397,6 +397,8 @@ pub struct TradeResponse {
     pub status: TradeStatusType,
     #[serde_as(as = "TimestampSeconds<String>")]
     pub match_time: DateTime<Utc>,
+    #[serde(default)]
+    pub match_time_nano: Option<String>,
     #[serde_as(as = "TimestampSeconds<String>")]
     pub last_update: DateTime<Utc>,
     pub outcome: String,
