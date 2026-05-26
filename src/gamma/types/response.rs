@@ -761,3 +761,58 @@ pub struct SearchResults {
     pub profiles: Option<Vec<Profile>>,
     pub pagination: Option<Pagination>,
 }
+
+#[cfg(test)]
+mod event_tests {
+    use rust_decimal_macros::dec;
+
+    use super::{Event, FeeSchedule};
+
+    #[test]
+    fn gamma_event_parses_v2_fee_schedule() {
+        let json = r#"{
+            "id": "e1",
+            "feeSchedule": {
+                "exponent": 1,
+                "rate": 0.07,
+                "rebateRate": 0.2,
+                "takerOnly": true
+            }
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(
+            event.fee_schedule,
+            Some(FeeSchedule {
+                exponent: Some(1),
+                rate: Some(dec!(0.07)),
+                rebate_rate: Some(dec!(0.2)),
+                taker_only: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn gamma_event_parses_v2_fee_type() {
+        let json = r#"{
+            "id": "e1",
+            "feeType": "crypto_fees_v2"
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(event.fee_type, Some("crypto_fees_v2".to_owned()));
+    }
+
+    #[test]
+    fn gamma_event_parses_v2_event_metadata() {
+        let json = r#"{
+            "id": "e1",
+            "eventMetadata": {
+                "finalPrice": 0.10382,
+                "priceToBeat": 0.11049
+            }
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        let metadata = event.event_metadata.expect("eventMetadata missing");
+        assert_eq!(metadata["finalPrice"].as_f64(), Some(0.10382));
+        assert_eq!(metadata["priceToBeat"].as_f64(), Some(0.11049));
+    }
+}

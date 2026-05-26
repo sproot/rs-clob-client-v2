@@ -1071,4 +1071,55 @@ mod trade_response_tests {
             Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
         );
     }
+
+    /// Build a `TradeResponse` JSON with an extra trailing block of fields.
+    /// The base fixture already terminates after `trader_side`, so the
+    /// `extras` string must lead with a comma if non-empty.
+    fn trade_response_json_with_extras(extras: &str) -> String {
+        let base = trade_response_json(None);
+        // Insert extras just before the closing brace.
+        let trimmed = base.trim_end();
+        let stripped = trimmed
+            .strip_suffix('}')
+            .expect("trade_response_json must end with `}`");
+        format!("{stripped}{extras}\n}}")
+    }
+
+    #[test]
+    fn trade_response_parses_match_time_nano() {
+        let json = trade_response_json_with_extras(r#","match_time_nano":"1700000000123456789""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.match_time_nano, Some("1700000000123456789".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_parses_match_time_nano_when_null() {
+        // Regression: `#[serde(default)] Option<String>` must accept JSON
+        // `null` cleanly (not just an omitted key). The sibling
+        // `match_time` is non-Option `DateTime<Utc>`, so before this field
+        // existed `null` for the nano field would have had nowhere to land
+        // and would have surfaced as an unknown field WARN.
+        let json = trade_response_json_with_extras(r#","match_time_nano":null"#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(tr.match_time_nano.is_none());
+    }
+
+    #[test]
+    fn trade_response_alias_err_msg_into_error_msg() {
+        // V2 wire form: API emits `err_msg`; the alias routes it into the
+        // existing Rust field `error_msg`.
+        let json = trade_response_json_with_extras(r#","err_msg":"oops""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_alias_error_msg_into_error_msg() {
+        // Regression: the legacy `error_msg` wire form must still
+        // deserialize after the alias was added. Pins `alias` vs `rename`
+        // — `rename = "err_msg"` would break this test.
+        let json = trade_response_json_with_extras(r#","error_msg":"oops""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+    }
 }
