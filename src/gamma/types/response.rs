@@ -221,6 +221,17 @@ pub struct Collection {
     pub header_image_optimized: Option<ImageOptimization>,
 }
 
+/// V2 fee schedule attached to an event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct FeeSchedule {
+    pub exponent: Option<u32>,
+    pub rate: Option<Decimal>,
+    pub rebate_rate: Option<Decimal>,
+    pub taker_only: Option<bool>,
+}
+
 /// A prediction market event.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
@@ -334,6 +345,12 @@ pub struct Event {
     pub cumulative_markets: Option<bool>,
     pub away_team_name: Option<String>,
     pub home_team_name: Option<String>,
+    #[serde(default)]
+    pub fee_schedule: Option<FeeSchedule>,
+    #[serde(default)]
+    pub fee_type: Option<String>,
+    #[serde(default)]
+    pub event_metadata: Option<serde_json::Value>,
 }
 
 /// A prediction market.
