@@ -411,7 +411,7 @@ pub struct TradeResponse {
     /// On-chain transaction hash.
     pub transaction_hash: B256,
     pub trader_side: TraderSide,
-    #[serde(default)]
+    #[serde(default, alias = "err_msg")]
     pub error_msg: Option<String>,
 }
 
