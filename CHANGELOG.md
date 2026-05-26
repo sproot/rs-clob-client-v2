@@ -87,17 +87,22 @@ otherwise the wire format will drift from what Polymarket sends.
 
 ### Added
 
-Three V2 schema fields on `gamma::types::response::Event`:
+Two V2 schema fields on `gamma::types::response::Market`:
 
 - `fee_schedule: Option<FeeSchedule>` (wire: `feeSchedule`) —
   new typed `FeeSchedule` struct with `exponent`, `rate`,
   `rebate_rate`, `taker_only` (all `Option`-wrapped). Maps the
   observed wire shape `{"exponent": 1, "rate": 0.07,
-  "rebateRate": 0.2, "takerOnly": true}`.
+  "rebateRate": 0.2, "takerOnly": true}`. Per Polymarket's
+  Gamma event docs, `feeSchedule` is per-market, not top-level
+  on `Event`.
 - `fee_type: Option<String>` (wire: `feeType`) — kept as
   `String` for now; observed values include `"crypto_fees_v2"`
   and `"finance_prices_fees"`. May become a typed enum in a
-  follow-up if vocabulary stabilizes.
+  follow-up if vocabulary stabilizes. Also per-market.
+
+One V2 schema field on `gamma::types::response::Event`:
+
 - `event_metadata: Option<serde_json::Value>` (wire:
   `eventMetadata`) — untyped pass-through; observed shape varies
   per event.
