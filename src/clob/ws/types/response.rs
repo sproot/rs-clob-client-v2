@@ -9,6 +9,7 @@ use crate::auth::ApiKey;
 use crate::clob::types::{OrderStatusType, Side, TraderSide};
 use crate::clob::ws::interest::MessageInterest;
 use crate::error::Kind;
+use crate::serde_helpers::OptionalDecimalFromEmptyString;
 use crate::types::{B256, Decimal, U256};
 
 /// Top-level WebSocket message wrapper.
@@ -167,7 +168,11 @@ pub struct LastTradePrice {
     pub side: Option<Side>,
     /// Size of the last trade
     pub size: Option<Decimal>,
-    /// Fee rate in basis points
+    /// Fee rate in basis points. `None` when the API returns an empty string
+    /// (`""`), `null`, or omits the field — semantically "fee unknown",
+    /// distinct from a zero fee.
+    #[serde(default)]
+    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
     pub fee_rate_bps: Option<Decimal>,
     /// Unix timestamp in milliseconds
     #[serde_as(as = "DisplayFromStr")]
@@ -374,8 +379,11 @@ pub struct TradeMessage {
     /// Array of maker order details
     #[serde(default)]
     pub maker_orders: Vec<MakerOrder>,
-    /// Fee rate in basis points (string in API response)
+    /// Fee rate in basis points. `None` when the API returns an empty string
+    /// (`""`), `null`, or omits the field — semantically "fee unknown",
+    /// distinct from a zero fee.
     #[serde(default)]
+    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
     pub fee_rate_bps: Option<Decimal>,
     /// On-chain transaction hash
     #[serde_as(as = "NoneAsEmptyString")]
@@ -1223,5 +1231,159 @@ mod tests {
             }
             _ => panic!("Expected MarketResolved message"),
         }
+    }
+
+    /// Build a `LastTradePrice` JSON document. The `fee_rate_bps` slot is
+    /// interpolated raw so callers can supply a quoted string, a JSON literal,
+    /// `null`, or omit the key entirely (pass `None`).
+    fn last_trade_price_json(fee_rate_bps: Option<&str>) -> String {
+        let fee_field = match fee_rate_bps {
+            Some(v) => format!(",\"fee_rate_bps\":{v}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "event_type": "last_trade_price",
+                "asset_id": "114122071509644379678018727908709560226618148003371446110114509806601493071694",
+                "market": "0x6a67b9d828d53862160e470329ffea5246f338ecfffdf2cab45211ec578b0347",
+                "price": "0.456",
+                "side": "BUY",
+                "size": "219.217767",
+                "timestamp": "1750428146322"{fee_field}
+            }}"#
+        )
+    }
+
+    fn parse_last_trade_price(json: &str) -> LastTradePrice {
+        match serde_json::from_str::<WsMessage>(json).expect("deserialization failed") {
+            WsMessage::LastTradePrice(ltp) => ltp,
+            other => panic!("Expected LastTradePrice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_trade_price_deserializes_with_empty_string_fee_rate_bps() {
+        let json = last_trade_price_json(Some(r#""""#));
+        let ltp = parse_last_trade_price(&json);
+        assert!(ltp.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn last_trade_price_deserializes_with_null_fee_rate_bps() {
+        let json = last_trade_price_json(Some("null"));
+        let ltp = parse_last_trade_price(&json);
+        assert!(ltp.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn last_trade_price_deserializes_with_missing_fee_rate_bps() {
+        let json = last_trade_price_json(None);
+        let ltp = parse_last_trade_price(&json);
+        assert!(ltp.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn last_trade_price_deserializes_with_valid_decimal_fee_rate_bps() {
+        let json = last_trade_price_json(Some(r#""10""#));
+        let ltp = parse_last_trade_price(&json);
+        assert_eq!(ltp.fee_rate_bps, Some(Decimal::from(10)));
+    }
+
+    #[test]
+    fn last_trade_price_fails_on_invalid_non_empty_string_fee_rate_bps() {
+        let json = last_trade_price_json(Some(r#""not_a_number""#));
+        let result: Result<WsMessage, _> = serde_json::from_str(&json);
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn last_trade_price_deserializes_with_scientific_notation_fee_rate_bps() {
+        // Regression: rust_decimal's default visitor accepts `"9.7e-7"` via its
+        // `from_scientific` fallback. The custom helper must preserve that to
+        // avoid failing whole pages on exotic but valid encodings.
+        let json = last_trade_price_json(Some(r#""9.7e-7""#));
+        let ltp = parse_last_trade_price(&json);
+        assert_eq!(
+            ltp.fee_rate_bps,
+            Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+        );
+    }
+
+    /// Build a `TradeMessage` JSON document. The `fee_rate_bps` slot is
+    /// interpolated raw so callers can supply a quoted string, a JSON literal,
+    /// `null`, or omit the key entirely (pass `None`).
+    fn trade_message_json(fee_rate_bps: Option<&str>) -> String {
+        let fee_field = match fee_rate_bps {
+            Some(v) => format!(",\"fee_rate_bps\":{v}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "event_type": "trade",
+                "id": "trade123",
+                "market": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "asset_id": "106585164761922456203746651621390029417453862034640469075081961934906147433548",
+                "side": "BUY",
+                "size": "10",
+                "price": "0.5",
+                "status": "MATCHED",
+                "type": "TRADE"{fee_field}
+            }}"#
+        )
+    }
+
+    fn parse_trade_message(json: &str) -> TradeMessage {
+        match serde_json::from_str::<WsMessage>(json).expect("deserialization failed") {
+            WsMessage::Trade(t) => t,
+            other => panic!("Expected Trade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trade_message_deserializes_with_empty_string_fee_rate_bps() {
+        let json = trade_message_json(Some(r#""""#));
+        let t = parse_trade_message(&json);
+        assert!(t.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn trade_message_deserializes_with_null_fee_rate_bps() {
+        let json = trade_message_json(Some("null"));
+        let t = parse_trade_message(&json);
+        assert!(t.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn trade_message_deserializes_with_missing_fee_rate_bps() {
+        let json = trade_message_json(None);
+        let t = parse_trade_message(&json);
+        assert!(t.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn trade_message_deserializes_with_valid_decimal_fee_rate_bps() {
+        let json = trade_message_json(Some(r#""10""#));
+        let t = parse_trade_message(&json);
+        assert_eq!(t.fee_rate_bps, Some(Decimal::from(10)));
+    }
+
+    #[test]
+    fn trade_message_fails_on_invalid_non_empty_string_fee_rate_bps() {
+        let json = trade_message_json(Some(r#""not_a_number""#));
+        let result: Result<WsMessage, _> = serde_json::from_str(&json);
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn trade_message_deserializes_with_scientific_notation_fee_rate_bps() {
+        // Regression: rust_decimal's default visitor accepts `"9.7e-7"` via its
+        // `from_scientific` fallback. The custom helper must preserve that to
+        // avoid failing whole pages on exotic but valid encodings.
+        let json = trade_message_json(Some(r#""9.7e-7""#));
+        let t = parse_trade_message(&json);
+        assert_eq!(
+            t.fee_rate_bps,
+            Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+        );
     }
 }

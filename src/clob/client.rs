@@ -763,9 +763,7 @@ impl<S: State> Client<S> {
             version == 1 || version == 2,
             "cached_version must be 1 or 2; 0 is the cache-miss sentinel and other values pin the SDK to a non-existent protocol generation (got {version})",
         );
-        self.inner
-            .cached_version
-            .store(version, Ordering::Relaxed);
+        self.inner.cached_version.store(version, Ordering::Relaxed);
     }
 
     /// Checks if the CLOB API is healthy and operational.

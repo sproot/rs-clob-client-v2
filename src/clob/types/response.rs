@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::auth::ApiKey;
 use crate::clob::types::{OrderStatusType, OrderType, Side, TickSize, TradeStatusType, TraderSide};
-use crate::serde_helpers::StringFromAny;
+use crate::serde_helpers::{OptionalDecimalFromEmptyString, StringFromAny};
 use crate::types::{Address, B256, Decimal, U256};
 
 #[non_exhaustive]
@@ -388,7 +388,11 @@ pub struct TradeResponse {
     pub asset_id: U256,
     pub side: Side,
     pub size: Decimal,
-    pub fee_rate_bps: Decimal,
+    /// Fee rate in basis points. `None` when the API returns an empty string
+    /// (`""`) — semantically "fee unknown", distinct from a zero fee.
+    #[serde(default)]
+    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
+    pub fee_rate_bps: Option<Decimal>,
     pub price: Decimal,
     pub status: TradeStatusType,
     #[serde_as(as = "TimestampSeconds<String>")]
@@ -510,6 +514,7 @@ pub struct UserInfo {
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Builder, PartialEq)]
 #[builder(on(String, into))]
 pub struct MakerOrder {
@@ -518,7 +523,11 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
-    pub fee_rate_bps: Decimal,
+    /// Fee rate in basis points. `None` when the API returns an empty string
+    /// (`""`) — semantically "fee unknown", distinct from a zero fee.
+    #[serde(default)]
+    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
+    pub fee_rate_bps: Option<Decimal>,
     pub asset_id: U256,
     pub outcome: String,
     pub side: Side,
@@ -898,4 +907,166 @@ pub struct RfqQuote {
     pub size_out: Decimal,
     /// Quoted price.
     pub price: Decimal,
+}
+
+#[cfg(test)]
+mod maker_order_tests {
+    use super::MakerOrder;
+    use crate::types::Decimal;
+
+    /// Build a `MakerOrder` JSON document. The `fee_rate_bps` slot is interpolated
+    /// raw so callers can supply a quoted string, a JSON literal, `null`, or omit
+    /// the key entirely (pass `None`).
+    fn maker_order_json(fee_rate_bps: Option<&str>) -> String {
+        let fee_field = match fee_rate_bps {
+            Some(v) => format!(",\"fee_rate_bps\":{v}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "order_id": "maker_001",
+                "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "maker_address": "0x4444444444444444444444444444444444444444",
+                "matched_amount": "5.0",
+                "price": "0.42",
+                "asset_id": "1",
+                "outcome": "YES",
+                "side": "SELL"{fee_field}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_empty_string_fee_rate_bps() {
+        let json = maker_order_json(Some(r#""""#));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(mo.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_null_fee_rate_bps() {
+        let json = maker_order_json(Some("null"));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(mo.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_missing_fee_rate_bps() {
+        let json = maker_order_json(None);
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(mo.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_valid_decimal_fee_rate_bps() {
+        let json = maker_order_json(Some(r#""10""#));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(mo.fee_rate_bps, Some(Decimal::from(10)));
+    }
+
+    #[test]
+    fn maker_order_fails_on_invalid_non_empty_string_fee_rate_bps() {
+        let json = maker_order_json(Some(r#""not_a_number""#));
+        let result: Result<MakerOrder, _> = serde_json::from_str(&json);
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn maker_order_deserializes_with_scientific_notation_fee_rate_bps() {
+        // Regression: rust_decimal's default visitor accepts `"9.7e-7"` via
+        // its `from_scientific` fallback. The custom helper must preserve
+        // that to avoid failing whole pages on exotic but valid encodings.
+        let json = maker_order_json(Some(r#""9.7e-7""#));
+        let mo: MakerOrder = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(
+            mo.fee_rate_bps,
+            Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod trade_response_tests {
+    use super::TradeResponse;
+    use crate::types::Decimal;
+
+    /// Build a `TradeResponse` JSON document. The `fee_rate_bps` slot is
+    /// interpolated raw so callers can supply a quoted string, a JSON literal,
+    /// `null`, or omit the key entirely (pass `None`).
+    fn trade_response_json(fee_rate_bps: Option<&str>) -> String {
+        let fee_field = match fee_rate_bps {
+            Some(v) => format!(",\"fee_rate_bps\":{v}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "id": "1",
+                "taker_order_id": "taker_123",
+                "market": "0x000000000000000000000000000000000000000000000000000000006d61726b",
+                "asset_id": "1",
+                "side": "BUY",
+                "size": "12.5",
+                "price": "0.42",
+                "status": "MATCHED",
+                "match_time": "1705322096",
+                "last_update": "1705322130",
+                "outcome": "YES",
+                "bucket_index": 2,
+                "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "maker_address": "0x2222222222222222222222222222222222222222",
+                "maker_orders": [],
+                "transaction_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "trader_side": "TAKER"{fee_field}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn trade_response_deserializes_with_empty_string_fee_rate_bps() {
+        let json = trade_response_json(Some(r#""""#));
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(tr.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn trade_response_deserializes_with_null_fee_rate_bps() {
+        let json = trade_response_json(Some("null"));
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(tr.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn trade_response_deserializes_with_missing_fee_rate_bps() {
+        let json = trade_response_json(None);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(tr.fee_rate_bps.is_none());
+    }
+
+    #[test]
+    fn trade_response_deserializes_with_valid_decimal_fee_rate_bps() {
+        let json = trade_response_json(Some(r#""10""#));
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.fee_rate_bps, Some(Decimal::from(10)));
+    }
+
+    #[test]
+    fn trade_response_fails_on_invalid_non_empty_string_fee_rate_bps() {
+        let json = trade_response_json(Some(r#""not_a_number""#));
+        let result: Result<TradeResponse, _> = serde_json::from_str(&json);
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn trade_response_deserializes_with_scientific_notation_fee_rate_bps() {
+        // Regression: rust_decimal's default visitor accepts `"9.7e-7"` via
+        // its `from_scientific` fallback. The custom helper must preserve
+        // that to avoid failing whole `/data/trades` pages on exotic but
+        // valid encodings.
+        let json = trade_response_json(Some(r#""9.7e-7""#));
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(
+            tr.fee_rate_bps,
+            Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
+        );
+    }
 }

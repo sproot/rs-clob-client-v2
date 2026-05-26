@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — polymarket-bot-customizations branch
+
+### Changed (breaking)
+
+All four `fee_rate_bps` fields in the REST and WS response types
+move from `Decimal` (or plain `Option<Decimal>` with the default
+`Decimal` deserializer) to `Option<Decimal>` backed by the new
+`OptionalDecimalFromEmptyString` serde helper. Empty string `""`,
+`null`, and missing field all deserialize to `None`. Valid decimal
+strings (`"10"`, `"0.5"`) and scientific-notation strings
+(`"9.7e-7"`, `"5e0"`) deserialize to `Some(Decimal)`. Invalid
+non-empty strings propagate as deserialization errors.
+
+- `clob::types::response::MakerOrder.fee_rate_bps` (REST)
+- `clob::types::response::TradeResponse.fee_rate_bps` (REST)
+- `clob::ws::types::response::LastTradePrice.fee_rate_bps` (WS) —
+  was already `Option<Decimal>` but the inner `Decimal`
+  deserializer still failed on `""`.
+- `clob::ws::types::response::TradeMessage.fee_rate_bps` (WS) —
+  same as above.
+
+### Reason
+
+The Polymarket v2 `/data/trades` REST endpoint returns
+`fee_rate_bps: ""` for orders whose maker-side fee is unknown or
+not applicable (V2 derives fees at match time rather than from
+the signed order). The same empty-string pattern can also appear
+on the WS `trade` and `last_trade_price` channels. The previous
+`Decimal` type rejected the empty string and failed entire
+response pages or dropped WS messages. The new `Option<Decimal>`
++ helper makes the absence representable instead of an error.
+
+### Migration
+
+`None` means "fee unknown" — semantically distinct from a zero
+fee. Handle the two cases explicitly with `match` or `if let`:
+
+```rust
+match trade.fee_rate_bps {
+    Some(bps) => {
+        // propagate or use the fee, e.g. credit/debit accounting
+    }
+    None => {
+        // fee unknown for this leg — skip the fee step, log at
+        // DEBUG, or escalate per the caller's policy
+    }
+}
+```
+
+or, when the unknown case is a no-op:
+
+```rust
+if let Some(bps) = trade.fee_rate_bps {
+    // use bps
+}
+```
+
+**Do NOT collapse `None` to `Decimal::ZERO` via `unwrap_or`.**
+That is banned by the bot project's policy on financial data
+(`~/.claude/CLAUDE.md`): it silently conflates "fee unknown" with
+"fee = 0" and hides genuine API-side data gaps inside accounting.
+If a caller truly wants a zero default and has reviewed why that
+is safe for its specific code path, it must say so with a comment
+naming the invariant — not slip it in behind an `unwrap_or`.
+
+All four newly-affected types (`MakerOrder`, `TradeResponse`,
+`LastTradePrice`, `TradeMessage`) share these semantics; the
+migration is the same for each.
+
+#### Write-side / round-trip asymmetry
+
+The helper only handles the deserialize path. `Option<Decimal>`
+keeps its default `Serialize` derive, so a `None` round-trips to
+JSON `null`, not the upstream `""`. The bot does not currently
+re-`POST` these structs back to Polymarket, so this is not a
+runtime concern today — but any future caller that does a
+full round-trip must coerce `None → ""` on the way out itself
+(e.g. via a custom serializer or pre-serialization fixup),
+otherwise the wire format will drift from what Polymarket sends.
+
 ## [Unreleased]
 
 ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
