@@ -378,7 +378,7 @@ pub struct CancelOrdersResponse {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Builder, PartialEq)]
-#[serde(try_from = "TradeResponseRaw")]
+#[serde(from = "TradeResponseRaw")]
 #[builder(on(String, into))]
 pub struct TradeResponse {
     pub id: String,
@@ -453,12 +453,13 @@ struct TradeResponseRaw {
     err_msg: Option<String>,
 }
 
-impl TryFrom<TradeResponseRaw> for TradeResponse {
-    type Error = String;
-
-    fn try_from(raw: TradeResponseRaw) -> std::result::Result<Self, Self::Error> {
-        let error_msg = coalesce_error_msg(raw.error_msg, raw.err_msg)?;
-        Ok(Self {
+impl From<TradeResponseRaw> for TradeResponse {
+    fn from(raw: TradeResponseRaw) -> Self {
+        // Argument order matches the wire-key precedence documented on
+        // `coalesce_error_msg`: legacy `error_msg` first, V2 `err_msg`
+        // second. V2 wins on mismatch.
+        let error_msg = coalesce_error_msg(raw.error_msg, raw.err_msg);
+        Self {
             id: raw.id,
             taker_order_id: raw.taker_order_id,
             market: raw.market,
@@ -479,7 +480,7 @@ impl TryFrom<TradeResponseRaw> for TradeResponse {
             transaction_hash: raw.transaction_hash,
             trader_side: raw.trader_side,
             error_msg,
-        })
+        }
     }
 }
 
@@ -489,29 +490,42 @@ impl TryFrom<TradeResponseRaw> for TradeResponse {
 /// During an API rollout a trade row can briefly carry both keys. The
 /// previous `#[serde(alias)]` approach would have rejected such a row as a
 /// duplicate field, which in turn would fail the *entire* `/data/trades`
-/// page. The rules below preserve as much information as possible while
-/// still surfacing genuine schema conflicts:
+/// page. An earlier iteration of this code returned an `Err` on key
+/// mismatch, which had the same fatal effect: one rolled-over row could
+/// abort a whole page of trade history. That is worse than picking a
+/// deterministic value, so the rules below never fail the row:
 ///
 /// - Empty strings are treated as "no error" (same as the API's existing
 ///   semantics for `error_msg = ""`). They are normalised to `None` before
 ///   matching so the cases are symmetric.
 /// - Either key alone → take its value.
 /// - Both keys, equal non-empty value → take that value.
-/// - Both keys, different non-empty values → genuine schema conflict; bubble
-///   up a `Deserialize` error so we hear about it at parse time rather than
-///   silently losing data.
-fn coalesce_error_msg(
-    error_msg: Option<String>,
-    err_msg: Option<String>,
-) -> std::result::Result<Option<String>, String> {
+/// - Both keys, different non-empty values → forward-looking V2 `err_msg`
+///   wins; emit a `tracing::warn!` so schema drift is observable without
+///   making `/data/trades` unavailable.
+fn coalesce_error_msg(error_msg: Option<String>, err_msg: Option<String>) -> Option<String> {
     let normalise = |s: Option<String>| s.filter(|v| !v.is_empty());
     match (normalise(error_msg), normalise(err_msg)) {
-        (None, None) => Ok(None),
-        (Some(v), None) | (None, Some(v)) => Ok(Some(v)),
-        (Some(a), Some(b)) if a == b => Ok(Some(a)),
-        (Some(a), Some(b)) => Err(format!(
-            "TradeResponse: conflicting error_msg and err_msg values: {a:?} vs {b:?}"
-        )),
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(legacy_val), Some(v2_val)) => {
+            // Schema drift: both keys populated with different values.
+            // V2 wins (forward-looking), but emit a warning for
+            // observability. The `let _: &String = &legacy_val;` line
+            // exists only to consume the binding when the `tracing`
+            // feature is off, so `-D warnings` stays clean — see the
+            // same pattern in `rtds::subscription` and `ws::connection`.
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                legacy_error_msg = %legacy_val,
+                v2_err_msg = %v2_val,
+                "TradeResponse: legacy error_msg and v2 err_msg differ — using v2"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _: &String = &legacy_val;
+            Some(v2_val)
+        }
     }
 }
 
@@ -1248,15 +1262,19 @@ mod trade_response_tests {
     }
 
     #[test]
-    fn trade_response_both_keys_different_values_errors() {
-        // Genuine schema conflict — two different non-empty messages on
-        // the same row. Surface it as a deserialization error so the
-        // upstream regression is caught at parse time instead of
-        // silently dropping one of the two messages.
+    fn trade_response_both_keys_different_values_prefers_v2_and_warns() {
+        // Schema drift — two different non-empty messages on the same
+        // row. Earlier iterations failed the parse here, which would
+        // take down the whole `/data/trades` page during a rollout
+        // mismatch. The current rule picks the forward-looking V2
+        // `err_msg` value and emits a `tracing::warn!` for visibility.
+        // The warn is not asserted in this unit test (would require
+        // wiring a tracing subscriber); coalesce-precedence is the
+        // user-visible contract and is what we pin here.
         let json =
             trade_response_json_with_extras(r#","error_msg":"legacy","err_msg":"v2_message""#);
-        let result: Result<TradeResponse, _> = serde_json::from_str(&json);
-        result.unwrap_err();
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("v2_message".to_owned()));
     }
 
     #[test]
