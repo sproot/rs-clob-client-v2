@@ -129,17 +129,25 @@ impl<'de> serde_with::DeserializeAs<'de, Option<crate::types::Decimal>>
                 E: de::Error,
             {
                 if v.is_empty() {
-                    Ok(None)
-                } else {
-                    // Mirror `rust_decimal`'s own serde visitor: try `from_str`
-                    // first, fall back to `from_scientific` so encodings like
-                    // `"9.7e-7"` or `"5e0"` keep deserializing as they did
-                    // before this helper existed.
-                    Decimal::from_str(v)
-                        .or_else(|_| Decimal::from_scientific(v))
-                        .map(Some)
-                        .map_err(E::custom)
+                    return Ok(None);
                 }
+                // Mirror `rust_decimal`'s own serde visitor: try `from_str`
+                // first, fall back to `from_scientific` so encodings like
+                // `"9.7e-7"` or `"5e0"` keep deserializing as they did
+                // before this helper existed. If both fail, surface both
+                // attempted-parse errors so operators reading logs aren't
+                // misled into thinking only scientific notation was tried.
+                let plain_err = match Decimal::from_str(v) {
+                    Ok(d) => return Ok(Some(d)),
+                    Err(err) => err,
+                };
+                let sci_err = match Decimal::from_scientific(v) {
+                    Ok(d) => return Ok(Some(d)),
+                    Err(err) => err,
+                };
+                Err(E::custom(format!(
+                    "failed to parse {v:?} as Decimal: not a plain decimal ({plain_err}) and not scientific notation ({sci_err})"
+                )))
             }
 
             fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
@@ -760,6 +768,18 @@ mod tests {
             let result: OptionalDecimalStruct =
                 serde_json::from_value(json).expect("deserialization failed");
             assert_eq!(result.value, Some(Decimal::from(42)));
+        }
+
+        #[test]
+        fn decodes_negative_unquoted_integer_as_some() {
+            // `serde_json::Value::deserialize_any` only routes through
+            // `visit_i64` for negative integers (positive integers reach
+            // `visit_u64`). Cover the negative branch explicitly so the helper
+            // doesn't silently regress to losing the sign of i64-encoded fees.
+            let json = serde_json::json!({ "value": -42 });
+            let result: OptionalDecimalStruct =
+                serde_json::from_value(json).expect("deserialization failed");
+            assert_eq!(result.value, Some(Decimal::from(-42)));
         }
 
         #[test]
