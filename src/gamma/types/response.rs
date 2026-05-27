@@ -221,6 +221,17 @@ pub struct Collection {
     pub header_image_optimized: Option<ImageOptimization>,
 }
 
+/// V2 fee schedule attached to a market.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct FeeSchedule {
+    pub exponent: Option<u32>,
+    pub rate: Option<Decimal>,
+    pub rebate_rate: Option<Decimal>,
+    pub taker_only: Option<bool>,
+}
+
 /// A prediction market event.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Builder)]
@@ -334,6 +345,8 @@ pub struct Event {
     pub cumulative_markets: Option<bool>,
     pub away_team_name: Option<String>,
     pub home_team_name: Option<String>,
+    #[serde(default)]
+    pub event_metadata: Option<serde_json::Value>,
 }
 
 /// A prediction market.
@@ -499,6 +512,10 @@ pub struct Market {
     pub approved: Option<bool>,
     pub cyom: Option<bool>,
     pub fees_enabled: Option<bool>,
+    #[serde(default)]
+    pub fee_schedule: Option<FeeSchedule>,
+    #[serde(default)]
+    pub fee_type: Option<String>,
     pub holding_rewards_enabled: Option<bool>,
     pub neg_risk: Option<bool>,
     #[serde_as(as = "NoneAsEmptyString")]
@@ -743,4 +760,81 @@ pub struct SearchResults {
     pub tags: Option<Vec<SearchTag>>,
     pub profiles: Option<Vec<Profile>>,
     pub pagination: Option<Pagination>,
+}
+
+#[cfg(test)]
+mod event_tests {
+    use rust_decimal_macros::dec;
+
+    use super::{Event, FeeSchedule};
+
+    #[test]
+    fn gamma_market_parses_v2_fee_schedule() {
+        let json = r#"{
+            "id": "e1",
+            "markets": [{
+                "id": "m1",
+                "feeSchedule": {
+                    "exponent": 1,
+                    "rate": 0.07,
+                    "rebateRate": 0.2,
+                    "takerOnly": true
+                }
+            }]
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        let markets = event.markets.expect("markets missing");
+        assert_eq!(
+            markets[0].fee_schedule,
+            Some(FeeSchedule {
+                exponent: Some(1),
+                rate: Some(dec!(0.07)),
+                rebate_rate: Some(dec!(0.2)),
+                taker_only: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn gamma_market_parses_v2_fee_type() {
+        let json = r#"{
+            "id": "e1",
+            "markets": [{
+                "id": "m1",
+                "feeType": "crypto_fees_v2"
+            }]
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        let markets = event.markets.expect("markets missing");
+        assert_eq!(markets[0].fee_type, Some("crypto_fees_v2".to_owned()));
+    }
+
+    #[test]
+    fn gamma_event_parses_v2_event_metadata() {
+        let json = r#"{
+            "id": "e1",
+            "eventMetadata": {
+                "finalPrice": 0.10382,
+                "priceToBeat": 0.11049
+            }
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        let metadata = event.event_metadata.expect("eventMetadata missing");
+        assert_eq!(metadata["finalPrice"].as_f64(), Some(0.10382));
+        assert_eq!(metadata["priceToBeat"].as_f64(), Some(0.11049));
+    }
+
+    #[test]
+    fn gamma_market_ignores_missing_fee_fields_via_default() {
+        let json = r#"{
+            "id": "e1",
+            "markets": [{
+                "id": "m1"
+            }]
+        }"#;
+        let event: Event = serde_json::from_str(json).expect("deserialization failed");
+        let markets = event.markets.expect("markets missing");
+        assert_eq!(markets[0].fee_schedule, None);
+        assert_eq!(markets[0].fee_type, None);
+    }
 }

@@ -377,8 +377,8 @@ pub struct CancelOrdersResponse {
 }
 
 #[non_exhaustive]
-#[serde_as]
 #[derive(Debug, Clone, Deserialize, Builder, PartialEq)]
+#[serde(from = "TradeResponseRaw")]
 #[builder(on(String, into))]
 pub struct TradeResponse {
     pub id: String,
@@ -390,27 +390,143 @@ pub struct TradeResponse {
     pub size: Decimal,
     /// Fee rate in basis points. `None` when the API returns an empty string
     /// (`""`) — semantically "fee unknown", distinct from a zero fee.
-    #[serde(default)]
-    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
     pub fee_rate_bps: Option<Decimal>,
     pub price: Decimal,
     pub status: TradeStatusType,
-    #[serde_as(as = "TimestampSeconds<String>")]
     pub match_time: DateTime<Utc>,
-    #[serde_as(as = "TimestampSeconds<String>")]
+    pub match_time_nano: Option<String>,
     pub last_update: DateTime<Utc>,
     pub outcome: String,
     pub bucket_index: u32,
     pub owner: ApiKey,
     pub maker_address: Address,
-    #[serde(default)]
-    #[serde_as(deserialize_as = "DefaultOnNull")]
     pub maker_orders: Vec<MakerOrder>,
     /// On-chain transaction hash.
     pub transaction_hash: B256,
     pub trader_side: TraderSide,
-    #[serde(default)]
+    /// Populated from either the legacy `error_msg` wire key or the V2
+    /// `err_msg` key. See `TradeResponseRaw` for the dual-key coalescing
+    /// rules.
     pub error_msg: Option<String>,
+}
+
+/// Internal wire-format mirror of [`TradeResponse`]. All serde / `serde_as`
+/// attributes that drive `/data/trades` deserialization live here — keep
+/// this struct as the single source of truth for wire parsing.
+///
+/// The split exists so that `error_msg` can be sourced from either the
+/// legacy `error_msg` key or the V2 `err_msg` key without serde rejecting
+/// payloads that happen to carry both during a rollout window. See
+/// [`coalesce_error_msg`] for the coalescing rules.
+#[serde_as]
+#[derive(Deserialize)]
+struct TradeResponseRaw {
+    id: String,
+    taker_order_id: String,
+    market: B256,
+    asset_id: U256,
+    side: Side,
+    size: Decimal,
+    #[serde(default)]
+    #[serde_as(deserialize_as = "OptionalDecimalFromEmptyString")]
+    fee_rate_bps: Option<Decimal>,
+    price: Decimal,
+    status: TradeStatusType,
+    #[serde_as(as = "TimestampSeconds<String>")]
+    match_time: DateTime<Utc>,
+    #[serde(default)]
+    match_time_nano: Option<String>,
+    #[serde_as(as = "TimestampSeconds<String>")]
+    last_update: DateTime<Utc>,
+    outcome: String,
+    bucket_index: u32,
+    owner: ApiKey,
+    maker_address: Address,
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
+    maker_orders: Vec<MakerOrder>,
+    transaction_hash: B256,
+    trader_side: TraderSide,
+    #[serde(default)]
+    error_msg: Option<String>,
+    #[serde(default)]
+    err_msg: Option<String>,
+}
+
+impl From<TradeResponseRaw> for TradeResponse {
+    fn from(raw: TradeResponseRaw) -> Self {
+        // Argument order matches the wire-key precedence documented on
+        // `coalesce_error_msg`: legacy `error_msg` first, V2 `err_msg`
+        // second. V2 wins on mismatch.
+        let error_msg = coalesce_error_msg(raw.error_msg, raw.err_msg);
+        Self {
+            id: raw.id,
+            taker_order_id: raw.taker_order_id,
+            market: raw.market,
+            asset_id: raw.asset_id,
+            side: raw.side,
+            size: raw.size,
+            fee_rate_bps: raw.fee_rate_bps,
+            price: raw.price,
+            status: raw.status,
+            match_time: raw.match_time,
+            match_time_nano: raw.match_time_nano,
+            last_update: raw.last_update,
+            outcome: raw.outcome,
+            bucket_index: raw.bucket_index,
+            owner: raw.owner,
+            maker_address: raw.maker_address,
+            maker_orders: raw.maker_orders,
+            transaction_hash: raw.transaction_hash,
+            trader_side: raw.trader_side,
+            error_msg,
+        }
+    }
+}
+
+/// Coalesce the legacy `error_msg` and V2 `err_msg` keys into a single
+/// `Option<String>`.
+///
+/// During an API rollout a trade row can briefly carry both keys. The
+/// previous `#[serde(alias)]` approach would have rejected such a row as a
+/// duplicate field, which in turn would fail the *entire* `/data/trades`
+/// page. An earlier iteration of this code returned an `Err` on key
+/// mismatch, which had the same fatal effect: one rolled-over row could
+/// abort a whole page of trade history. That is worse than picking a
+/// deterministic value, so the rules below never fail the row:
+///
+/// - Empty strings are treated as "no error" (same as the API's existing
+///   semantics for `error_msg = ""`). They are normalised to `None` before
+///   matching so the cases are symmetric.
+/// - Either key alone → take its value.
+/// - Both keys, equal non-empty value → take that value.
+/// - Both keys, different non-empty values → forward-looking V2 `err_msg`
+///   wins; emit a `tracing::warn!` so schema drift is observable without
+///   making `/data/trades` unavailable.
+fn coalesce_error_msg(error_msg: Option<String>, err_msg: Option<String>) -> Option<String> {
+    let normalise = |s: Option<String>| s.filter(|v| !v.is_empty());
+    match (normalise(error_msg), normalise(err_msg)) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(legacy_val), Some(v2_val)) => {
+            // Schema drift: both keys populated with different values.
+            // V2 wins (forward-looking), but emit a warning for
+            // observability. The `let _: &String = &legacy_val;` line
+            // exists only to consume the binding when the `tracing`
+            // feature is off, so `-D warnings` stays clean — see the
+            // same pattern in `rtds::subscription` and `ws::connection`.
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                legacy_error_msg = %legacy_val,
+                v2_err_msg = %v2_val,
+                "TradeResponse: legacy error_msg and v2 err_msg differ — using v2"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _: &String = &legacy_val;
+            Some(v2_val)
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -1068,5 +1184,106 @@ mod trade_response_tests {
             tr.fee_rate_bps,
             Some(Decimal::from_scientific("9.7e-7").expect("valid scientific decimal"))
         );
+    }
+
+    /// Build a `TradeResponse` JSON with an extra trailing block of fields.
+    /// The base fixture already terminates after `trader_side`, so the
+    /// `extras` string must lead with a comma if non-empty.
+    fn trade_response_json_with_extras(extras: &str) -> String {
+        let base = trade_response_json(None);
+        // Insert extras just before the closing brace.
+        let trimmed = base.trim_end();
+        let stripped = trimmed
+            .strip_suffix('}')
+            .expect("trade_response_json must end with `}`");
+        format!("{stripped}{extras}\n}}")
+    }
+
+    #[test]
+    fn trade_response_parses_match_time_nano() {
+        let json = trade_response_json_with_extras(r#","match_time_nano":"1700000000123456789""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.match_time_nano, Some("1700000000123456789".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_parses_match_time_nano_when_null() {
+        // Regression: `#[serde(default)] Option<String>` must accept JSON
+        // `null` cleanly (not just an omitted key). The sibling
+        // `match_time` is non-Option `DateTime<Utc>`, so before this field
+        // existed `null` for the nano field would have had nowhere to land
+        // and would have surfaced as an unknown field WARN.
+        let json = trade_response_json_with_extras(r#","match_time_nano":null"#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(tr.match_time_nano.is_none());
+    }
+
+    #[test]
+    fn trade_response_alias_err_msg_into_error_msg() {
+        // V2 wire form: API emits `err_msg`; the alias routes it into the
+        // existing Rust field `error_msg`.
+        let json = trade_response_json_with_extras(r#","err_msg":"oops""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_alias_error_msg_into_error_msg() {
+        // Regression: the legacy `error_msg` wire form must still
+        // deserialize after the alias was added. Pins `alias` vs `rename`
+        // — `rename = "err_msg"` would break this test.
+        let json = trade_response_json_with_extras(r#","error_msg":"oops""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_both_keys_same_value_coalesces() {
+        // Rollout window: API briefly emits both keys with the same
+        // value. The previous `#[serde(alias)]` would have rejected this
+        // as a duplicate field and failed the entire `/data/trades` page.
+        let json = trade_response_json_with_extras(r#","error_msg":"oops","err_msg":"oops""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_both_keys_one_empty_takes_non_empty() {
+        // Empty / null on one key + a real message on the other must
+        // surface the real message rather than treating the empty as a
+        // schema conflict.
+        let json = trade_response_json_with_extras(r#","error_msg":"","err_msg":"oops""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+
+        let json = trade_response_json_with_extras(r#","error_msg":"oops","err_msg":null"#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("oops".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_both_keys_different_values_prefers_v2_and_warns() {
+        // Schema drift — two different non-empty messages on the same
+        // row. Earlier iterations failed the parse here, which would
+        // take down the whole `/data/trades` page during a rollout
+        // mismatch. The current rule picks the forward-looking V2
+        // `err_msg` value and emits a `tracing::warn!` for visibility.
+        // The warn is not asserted in this unit test (would require
+        // wiring a tracing subscriber); coalesce-precedence is the
+        // user-visible contract and is what we pin here.
+        let json =
+            trade_response_json_with_extras(r#","error_msg":"legacy","err_msg":"v2_message""#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert_eq!(tr.error_msg, Some("v2_message".to_owned()));
+    }
+
+    #[test]
+    fn trade_response_both_keys_both_null_yields_none() {
+        // Both keys explicitly `null` is equivalent to neither being
+        // present. Pins the `#[serde(default)] Option<String>` behaviour
+        // on the raw struct's two fields.
+        let json = trade_response_json_with_extras(r#","error_msg":null,"err_msg":null"#);
+        let tr: TradeResponse = serde_json::from_str(&json).expect("deserialization failed");
+        assert!(tr.error_msg.is_none());
     }
 }

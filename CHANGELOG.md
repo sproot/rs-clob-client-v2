@@ -85,6 +85,53 @@ full round-trip must coerce `None → ""` on the way out itself
 (e.g. via a custom serializer or pre-serialization fixup),
 otherwise the wire format will drift from what Polymarket sends.
 
+### Added
+
+Two V2 schema fields on `gamma::types::response::Market`:
+
+- `fee_schedule: Option<FeeSchedule>` (wire: `feeSchedule`) —
+  new typed `FeeSchedule` struct with `exponent`, `rate`,
+  `rebate_rate`, `taker_only` (all `Option`-wrapped). Maps the
+  observed wire shape `{"exponent": 1, "rate": 0.07,
+  "rebateRate": 0.2, "takerOnly": true}`. Per Polymarket's
+  Gamma event docs, `feeSchedule` is per-market, not top-level
+  on `Event`.
+- `fee_type: Option<String>` (wire: `feeType`) — kept as
+  `String` for now; observed values include `"crypto_fees_v2"`
+  and `"finance_prices_fees"`. May become a typed enum in a
+  follow-up if vocabulary stabilizes. Also per-market.
+
+One V2 schema field on `gamma::types::response::Event`:
+
+- `event_metadata: Option<serde_json::Value>` (wire:
+  `eventMetadata`) — untyped pass-through; observed shape varies
+  per event.
+
+One V2 schema field on `clob::types::response::TradeResponse`:
+
+- `match_time_nano: Option<String>` — nanosecond-precision match
+  timestamp, kept string-typed per V2 OpenAPI.
+
+### Changed (non-breaking)
+
+`clob::types::response::TradeResponse.error_msg` now carries
+`#[serde(alias = "err_msg")]`. Both the legacy `error_msg` wire
+form and the V2 `err_msg` wire form deserialize into the existing
+`error_msg` Rust field. No call-site changes required for
+downstream consumers; the field name is unchanged.
+
+### Notes for downstream consumers
+
+Polymarket's V2 `POST /v1/heartbeats` endpoint returns
+`400 Invalid Heartbeat ID` for clients of this fork. The
+polymarket-bot downstream is dropping the SDK's `"heartbeats"`
+feature gate in its own `Cargo.toml` as of this release; the
+SDK's background `start_heartbeats` task will no longer spawn
+in that consumer. If your project depends on the SDK's
+`start_heartbeats` / `heartbeats_active` / `heartbeat_token`
+surface, keep the feature flag on — the SDK surface itself is
+unchanged; only the bot's feature subset is.
+
 ## [Unreleased]
 
 ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
